@@ -1,6 +1,6 @@
 #!/usr/bin/env nextflow
 params.outdir = "./results"
-params.input = "*.fastq.gz"
+params.input = "*_R{1,2}.fastq.gz"
 params.bwaindex = "*"
 params.fasta = "*.fa"
 params.fasta_fai = "*.fa.fai"
@@ -138,7 +138,7 @@ process BWAMEM2_MEM {
         \$INDEX \\
         $reads \\
         | samtools $samtools_command $args2 -@ $task.cpus -o ${prefix}.bam -
-        | samtools index -
+
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
         bwamem2: \$(echo \$(bwa-mem2 version 2>&1) | sed 's/.* //')
@@ -158,9 +158,57 @@ process BWAMEM2_MEM {
     """
 }
 
+process SAMTOOLS_INDEX {
+    tag "$meta.id"
+    label 'process_low'
+
+    conda "bioconda::samtools=1.17"
+    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+        'https://depot.galaxyproject.org/singularity/samtools:1.17--h00cdaf9_0' :
+        'quay.io/biocontainers/samtools:1.17--h00cdaf9_0' }"
+
+    input:
+    tuple val(meta), path(input)
+
+    output:
+    tuple val(meta), path("*.bai") , optional:true, emit: bai
+    tuple val(meta), path("*.csi") , optional:true, emit: csi
+    tuple val(meta), path("*.crai"), optional:true, emit: crai
+    path  "versions.yml"           , emit: versions
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    """
+    samtools \\
+        index \\
+        -@ ${task.cpus-1} \\
+        $args \\
+        $input
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        samtools: \$(echo \$(samtools --version 2>&1) | sed 's/^.*samtools //; s/Using.*\$//')
+    END_VERSIONS
+    """
+
+    stub:
+    """
+    touch ${input}.bai
+    touch ${input}.crai
+    touch ${input}.csi
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        samtools: \$(echo \$(samtools --version 2>&1) | sed 's/^.*samtools //; s/Using.*\$//')
+    END_VERSIONS
+    """
+}
+
 process FREEBAYES {
     tag "$meta.id"
     label 'process_single'
+    publishDir "$params.outdir/freebayes", mode:'copy'
 
     conda "bioconda::freebayes=1.3.6"
     container 'quay.io/biocontainers/freebayes:1.3.6--hbfe0e7f_2'
@@ -169,9 +217,9 @@ process FREEBAYES {
     tuple val(meta), path(input_1), path(input_1_index), path(input_2), path(input_2_index), path(target_bed)
     path fasta
     path fasta_fai
-    // path samples
-    // path populations
-    // path cnv
+    path samples
+    path populations
+    path cnv
 
     output:
     tuple val(meta), path("*.vcf.gz"), emit: vcf
@@ -185,17 +233,17 @@ process FREEBAYES {
     def prefix = task.ext.prefix ?: "${meta.id}"
     def input            = input_2        ? "${input_1} ${input_2}"        : "${input_1}"
     def targets_file     = target_bed     ? "--target ${target_bed}"       : ""
-    // def samples_file     = samples        ? "--samples ${samples}"         : ""
-    // def populations_file = populations    ? "--populations ${populations}" : ""
-    // def cnv_file         = cnv            ? "--cnv-map ${cnv}"             : ""
+    def samples_file     = samples        ? "--samples ${samples}"         : ""
+    def populations_file = populations    ? "--populations ${populations}" : ""
+    def cnv_file         = cnv            ? "--cnv-map ${cnv}"             : ""
 
     """
     freebayes \\
         -f $fasta \\
         $targets_file \\
-      #  $samples_file \\
-       # $populations_file \\
-      #  $cnv_file \\
+        $samples_file \\
+        $populations_file \\
+        $cnv_file \\
         $args \\
         $input > ${prefix}.vcf
     bgzip ${prefix}.vcf
@@ -296,7 +344,25 @@ workflow {
     ch_fastq.view()
    // FASTQC ( ch_fastq )
    // BWAMEM2_INDEX([ch_fastq, params.fasta])
-   // BWAMEM2_MEM(ch_fastq, params.bwaindex, true)
-     FREEBAYES([ch_fastq, params.bam, params.bam_bai], params.fasta, params.fasta_fai)
+    BWAMEM2_MEM(ch_fastq, params.bwaindex, true)
+    BWAMEM2_MEM.out.bam.view()
+    SAMTOOLS_INDEX(BWAMEM2_MEM.out.bam)
+    freebayes_ch = BWAMEM2_MEM.out.bam.join(SAMTOOLS_INDEX.out.bai)
+    freebayes_ch.view()
+
+  //  freebayes_ch_mapped = freebayes_ch.map {it -> [it[0], it[1], it[2]]}
+  //  freebayes_ch_mapped.view()
+    blank_ch = Channel.of("[]", "[]", "[]")
+    blank_ch.view { "valye: $it" }
+
+    freebayes_concat_ch = freebayes_ch.concat( blank_ch )
+    freebayes_concat_ch.view {"val: $it"}
+   
+   // another_freebayes_ch = freebayes_concat_ch.map {it -> [it[0], it[1], it[2], it[3], it[4], it [5]]}
+   // another_freebayes_ch.view()
+   
+   // FREEBAYES(freebayes_ch, params.fasta, params.fasta_fai, [], [], [])
+
+    // FREEBAYES([['id': 'test', single_end: false], params.bam, params.bam_bai, [], [], []], params.fasta, params.fasta_fai, [], [], [])
     // | ENSEMBLVEP_VEP
 }

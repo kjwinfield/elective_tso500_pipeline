@@ -4,12 +4,19 @@ params.input = "*_R{1,2}.fastq.gz"
 params.bwaindex = "*"
 params.fasta = "*.fa"
 params.fasta_fai = "*.fa.fai"
+params.dict = "*.dict"
 params.bam = "*.bam"
 params.bam_bai = "*.bam.bai"
+params.index = false
+
+include { ALIGN_BAM                         as ALIGN_RAW_BAM               } from './modules/alignbam/main'
+include { ALIGN_BAM                         as ALIGN_CONSENSUS_BAM         } from './modules/alignbam/main'
+
+
 
 process FASTQC {
     tag "$meta.id"
-    // label 'process_medium'
+    label 'process_medium'
     publishDir "$params.outdir/fastqc", mode:'copy'
 
     conda "bioconda::fastqc=0.11.9"
@@ -56,9 +63,102 @@ process FASTQC {
     """
 }
 
+process FGBIO_FASTQTOBAM {
+    tag "$meta.id"
+    label 'process_medium'
+
+    conda "bioconda::fgbio=2.0.2"
+    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+        'https://depot.galaxyproject.org/singularity/fgbio:2.0.2--hdfd78af_0' :
+        'quay.io/biocontainers/fgbio:2.0.2--hdfd78af_0' }"
+
+    input:
+    tuple val(meta), path(reads)
+
+    output:
+    tuple val(meta), path("*.bam") , emit: bam , optional: true
+    tuple val(meta), path("*.cram"), emit: cram, optional: true
+    path "versions.yml"            , emit: versions
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    def prefix = task.ext.prefix ?: "${meta.id}"
+    def sample_name = args.contains("--sample") ? "" : "--sample ${prefix}"
+    def library_name = args.contains("--library") ? "" : "--library ${prefix}"
+    def output = prefix =~ /\.(bam|cram)$/ ? prefix : "${prefix}.bam"
+    """
+
+    fgbio \\
+        --tmp-dir=. \\
+        FastqToBam \\
+        ${args} \\
+        --input ${reads} \\
+        --output ${output} \\
+        ${sample_name} \\
+        ${library_name}
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        fgbio: \$( echo \$(fgbio --version 2>&1 | tr -d '[:cntrl:]' ) | sed -e 's/^.*Version: //;s/\\[.*\$//')
+    END_VERSIONS
+    """
+}
+
+process SAMTOOLS_FASTQ{
+    // convert unsorted bam back to fastq format
+    container "quay.io/biocontainers/samtools:1.17--h00cdaf9_0"
+    
+    input:
+    tuple val(meta), path(bamfile)
+
+    output:
+    tuple val(meta), path("*_with_rx.fastq.gz"), emit: fastq
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    def prefix = task.ext.prefix ?: "${meta.id}"
+    """
+    samtools fastq $bamfile > ${prefix}_with_rx.fastq.gz 
+
+    """
+
+}
+
+process SAMTOOLS_SORT{
+    // sort bam by queryname
+    label 'process_medium'
+    container "quay.io/biocontainers/samtools:1.17--h00cdaf9_0"
+    
+    input:
+    tuple val(meta), path(bamfile)
+
+    output:
+    tuple val(meta), path("*_sortedbyqn.bam"), emit: bam
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    def prefix = task.ext.prefix ?: "${meta.id}"
+    """
+    samtools sort \\
+        -n $bamfile \\
+        -o ${prefix}_sortedbyqn.bam
+
+    """
+
+}
+
 process BWAMEM2_INDEX {
     tag "$fasta"
-    label 'process_single'
+    label 'process_high_memory'
 
     conda "bioconda::bwa-mem2=2.2.1"
     container 'quay.io/biocontainers/bwa-mem2:2.2.1--he513fc3_0'
@@ -104,7 +204,7 @@ process BWAMEM2_INDEX {
 
 process BWAMEM2_MEM {
     tag "$meta.id"
-    // label 'process_high'
+    label 'process_high'
     publishDir "$params.outdir/bwa-mem", mode:'copy'
 
     conda "bioconda::bwa-mem2=2.2.1 bioconda::samtools=1.16.1"
@@ -207,7 +307,7 @@ process SAMTOOLS_INDEX {
 
 process FREEBAYES {
     tag "$meta.id"
-    label 'process_single'
+    label 'process_medium'
     publishDir "$params.outdir/freebayes", mode:'copy'
 
     conda "bioconda::freebayes=1.3.6"
@@ -254,9 +354,222 @@ process FREEBAYES {
     """
 }
 
+process PICARD_SORTSAM {
+    tag "$meta.id"
+    label 'process_low'
+
+    conda "bioconda::picard=3.0.0"
+    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+        'https://depot.galaxyproject.org/singularity/picard:3.0.0--hdfd78af_1' :
+        'quay.io/biocontainers/picard:3.0.0--hdfd78af_1' }"
+
+    input:
+    tuple val(meta), path(bam)
+    val sort_order
+
+    output:
+    tuple val(meta), path("*.bam"), emit: bam
+    path "versions.yml"                  , emit: versions
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    def prefix = task.ext.prefix ?: "${meta.id}"
+    def avail_mem = 3072
+    if (!task.memory) {
+        log.info '[Picard SortSam] Available memory not known - defaulting to 3GB. Specify process memory requirements to change this.'
+    } else {
+        avail_mem = (task.memory.mega*0.8).intValue()
+    }
+    """
+    picard \\
+        SortSam \\
+        -Xmx${avail_mem}M \\
+        --INPUT $bam \\
+        --OUTPUT ${prefix}.bam \\
+        --SORT_ORDER $sort_order \\
+        --REFERENCE $params.fasta
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        picard: \$(picard SortSam --version 2>&1 | grep -o 'Version:.*' | cut -f2- -d:)
+    END_VERSIONS
+    """
+}
+
+process FGBIO_SETMATEINFORMATION{
+    label 'process_medium'
+    container "davelabhub/fgbio:2.0.2--hdfd78af_0"
+
+    input:
+    tuple val(meta), path(bamfile)
+
+    output:
+    tuple val(meta), path("*_w_mate_info.bam"), emit: bam
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    def prefix = task.ext.prefix ?: "${meta.id}"
+    """
+    fgbio \\
+        SetMateInformation \\
+        -i $bamfile \\
+        -o ${prefix}_w_mate_info.bam
+        
+
+    """
+}
+
+process FGBIO_GROUPREADSBYUMI {
+    tag "$meta.id"
+    label 'process_low'
+
+    conda "bioconda::fgbio=2.0.2"
+    container 'quay.io/biocontainers/fgbio:2.0.2--hdfd78af_0'
+
+    input:
+    tuple val(meta), path(taggedbam)
+    val(strategy)
+
+    output:
+    tuple val(meta), path("*_umi-grouped.bam")  , emit: bam
+    tuple val(meta), path("*_umi_histogram.txt"), emit: histogram
+    path "versions.yml"                         , emit: versions
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    def prefix = task.ext.prefix ?: "${meta.id}"
+
+    """
+
+    fgbio \\
+        --tmp-dir=. \\
+        GroupReadsByUmi \\
+        -s $strategy \\
+        $args \\
+        -i $taggedbam \\
+        -o ${prefix}_umi-grouped.bam \\
+        -f ${prefix}_umi_histogram.txt
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        fgbio: \$( echo \$(fgbio --version 2>&1 | tr -d '[:cntrl:]' ) | sed -e 's/^.*Version: //;s/\\[.*\$//')
+    END_VERSIONS
+    """
+}
+
+process FGBIO_CALLDUPLEXCONSENSUSREADS {
+    tag "$meta.id"
+    label 'process_medium'
+
+    conda "bioconda::fgbio=2.0.2"
+    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+        'https://depot.galaxyproject.org/singularity/fgbio:2.0.2--hdfd78af_0' :
+        'quay.io/biocontainers/fgbio:2.0.2--hdfd78af_0' }"
+
+    input:
+    tuple val(meta), path(bam)
+    // please note:
+    // --min-reads is a required argument with no default
+    // --min-input-base-quality is a required argument with no default
+    // make sure they are specified via ext.args in your config
+
+    output:
+    tuple val(meta), path("${prefix}.bam"), emit: bam
+    path "versions.yml"                     , emit: versions
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    prefix = task.ext.prefix ?: "${meta.id}_consensus"
+
+    def mem_gb = 8
+    if (!task.memory) {
+        log.info '[fgbio CallDuplexConsensusReads] Available memory not known - defaulting to 8GB. Specify process memory requirements to change this.'
+    } else if (mem_gb > task.memory.giga) {
+        if (task.memory.giga < 2) {
+            mem_gb = 1
+        } else {
+            mem_gb = task.memory.giga - 1
+        }
+    }
+
+    """
+    fgbio \\
+        -Xmx${mem_gb}g \\
+        --tmp-dir=. \\
+        --async-io=true \\
+        --compression=1 \\
+        CallDuplexConsensusReads \\
+        --input $bam \\
+        --output ${prefix}.bam \\
+        --threads ${task.cpus} \\
+        $args
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        fgbio: \$( echo \$(fgbio --version 2>&1 | tr -d '[:cntrl:]' ) | sed -e 's/^.*Version: //;s/\\[.*\$//')
+    END_VERSIONS
+    """
+}
+
+process ENSEMBLVEP_DOWNLOAD {
+    tag "$meta.id"
+    label 'process_high'
+
+    conda "bioconda::ensembl-vep=108.2"
+    container "quay.io/biocontainers/ensembl-vep:108.2--pl5321h4a94de4_0"
+
+    input:
+    tuple val(meta), val(assembly), val(species), val(cache_version)
+
+    output:
+    tuple val(meta), path("vep_cache"), emit: cache
+    path "versions.yml"               , emit: versions
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    """
+    vep_install \\
+        --CACHEDIR vep_cache \\
+        --SPECIES $species \\
+        --ASSEMBLY $assembly \\
+        --CACHE_VERSION $cache_version \\
+        $args
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        ensemblvep: \$( echo \$(vep --help 2>&1) | sed 's/^.*Versions:.*ensembl-vep : //;s/ .*\$//')
+    END_VERSIONS
+    """
+
+    stub:
+    """
+    mkdir vep_cache
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        ensemblvep: \$( echo \$(vep --help 2>&1) | sed 's/^.*Versions:.*ensembl-vep : //;s/ .*\$//')
+    END_VERSIONS
+    """
+}
+
 process ENSEMBLVEP_VEP {
     tag "$meta.id"
-    // label 'process_medium'
+    label 'process_medium'
     publishDir "$params.outdir/vep", mode:'copy'
 
 
@@ -271,8 +584,6 @@ process ENSEMBLVEP_VEP {
     val   species
     val   cache_version
     path  cache
-    tuple val(meta2), path(fasta)
-    path  extra_files
 
     output:
     tuple val(meta), path("*.vcf.gz")  , optional:true, emit: vcf
@@ -290,14 +601,13 @@ process ENSEMBLVEP_VEP {
     def compress_cmd = args.contains("--compress_output") ? '' : '--compress_output bgzip'
     def prefix = task.ext.prefix ?: "${meta.id}"
     def dir_cache = cache ? "\${PWD}/${cache}" : "/.vep"
-    def reference = fasta ? "--fasta $fasta" : ""
+  //  def reference = fasta ? "--fasta $fasta" : ""
     """
     vep \\
         -i $vcf \\
         -o ${prefix}.${file_extension}.gz \\
         $args \\
         $compress_cmd \\
-        $reference \\
         --assembly $genome \\
         --species $species \\
         --cache \\
@@ -342,27 +652,51 @@ workflow {
             [ fmeta, fastq ]
 	}
     ch_fastq.view()
-   // FASTQC ( ch_fastq )
-   // BWAMEM2_INDEX([ch_fastq, params.fasta])
-    BWAMEM2_MEM(ch_fastq, params.bwaindex, true)
-    BWAMEM2_MEM.out.bam.view()
-    SAMTOOLS_INDEX(BWAMEM2_MEM.out.bam)
-    freebayes_ch = BWAMEM2_MEM.out.bam.join(SAMTOOLS_INDEX.out.bai)
+    FASTQC ( ch_fastq )
+ 
+//     if ( params.index ) {
+//         BWAMEM2_INDEX([ch_fastq, params.fasta])
+//         index_ch = BWAMEM2_INDEX.out
+//     }
+//     else { //otherwise get channel from params.bwaindex
+//         index_ch = Channel.fromPath(params.bwaindex, checkIfExists: true)
+//     }
+//    
+//    
+//    // call bwamem2
+//   BWAMEM2_MEM(SAMTOOLS_FASTQ.out.fastq, params.bwaindex, true)
+   
+   // fix RX tags
+    FGBIO_FASTQTOBAM(ch_fastq)
+    SAMTOOLS_FASTQ(FGBIO_FASTQTOBAM.out.bam)
+    ALIGN_RAW_BAM(FGBIO_FASTQTOBAM.out.bam, params.fasta, params.dict, true)
+    
+    
+   // SAMTOOLS_SORT(BWAMEM2_MEM.out.bam)
+    //PICARD_SORTSAM([['id': 'test', single_end: false], '/home/dnanexus/HCC1187BL_WGS_32465911.1x.bam'], "queryname")
+
+    FGBIO_SETMATEINFORMATION(ALIGN_RAW_BAM.out.bam)
+    FGBIO_GROUPREADSBYUMI(FGBIO_SETMATEINFORMATION.out.bam, "Edit")
+    FGBIO_CALLDUPLEXCONSENSUSREADS(FGBIO_GROUPREADSBYUMI.out.bam)
+    
+    ALIGN_CONSENSUS_BAM(FGBIO_CALLDUPLEXCONSENSUSREADS.out.bam, params.fasta, params.dict, false)
+    
+    SAMTOOLS_INDEX(ALIGN_CONSENSUS_BAM.out.bam)
+
+    freebayes_ch = ALIGN_CONSENSUS_BAM.out.bam.join(SAMTOOLS_INDEX.out.bai)
     freebayes_ch.view()
 
-  //  freebayes_ch_mapped = freebayes_ch.map {it -> [it[0], it[1], it[2]]}
-  //  freebayes_ch_mapped.view()
-    blank_ch = Channel.of("[]", "[]", "[]")
-    blank_ch.view { "valye: $it" }
+    blank_ch = Channel.of([[],[],[]])
+    blank_ch.view()
 
-    freebayes_concat_ch = freebayes_ch.concat( blank_ch )
-    freebayes_concat_ch.view {"val: $it"}
-   
-   // another_freebayes_ch = freebayes_concat_ch.map {it -> [it[0], it[1], it[2], it[3], it[4], it [5]]}
-   // another_freebayes_ch.view()
-   
-   // FREEBAYES(freebayes_ch, params.fasta, params.fasta_fai, [], [], [])
+    freebayes_concat_ch = freebayes_ch.concat(blank_ch).toList()
+    freebayes_concat_ch.view()
 
-    // FREEBAYES([['id': 'test', single_end: false], params.bam, params.bam_bai, [], [], []], params.fasta, params.fasta_fai, [], [], [])
-    // | ENSEMBLVEP_VEP
+    freebayes_mapped = freebayes_concat_ch.map { it -> [it[0][0],it[0][1], it[0][2], it[1][0], it[1][1], it[1][2]]}
+    freebayes_mapped.view()
+   
+    FREEBAYES(freebayes_mapped, params.fasta, params.fasta_fai, [], [], [])
+
+  //  ENSEMBLVEP_DOWNLOAD([['id': 'test', single_end: false],"GRCh37","homo_sapiens","108"])
+  //  ENSEMBLVEP_VEP([['id': 'test', single_end: false], '/home/dnanexus/test.vcf.gz', [],], "GRCh37", "homo_sapiens", "108", '/home/dnanexus/vep_cache')
 }

@@ -5,8 +5,6 @@ params.bwaindex = "*"
 params.fasta = "*.fa"
 params.fasta_fai = "*.fa.fai"
 params.dict = "*.dict"
-params.bam = "*.bam"
-params.bam_bai = "*.bam.bai"
 params.index = false
 
 include { ALIGN_BAM                         as ALIGN_RAW_BAM               } from './modules/alignbam/main'
@@ -668,7 +666,7 @@ workflow {
    
    // fix RX tags
     FGBIO_FASTQTOBAM(ch_fastq)
-    SAMTOOLS_FASTQ(FGBIO_FASTQTOBAM.out.bam)
+  //  SAMTOOLS_FASTQ(FGBIO_FASTQTOBAM.out.bam)
     ALIGN_RAW_BAM(FGBIO_FASTQTOBAM.out.bam, params.fasta, params.dict, true)
     
     

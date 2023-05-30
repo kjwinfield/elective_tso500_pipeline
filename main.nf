@@ -7,8 +7,8 @@ params.fasta_fai = "*.fa.fai"
 params.dict = "*.dict"
 params.index = false
 
-include { ALIGN_BAM                         as ALIGN_RAW_BAM               } from './modules/alignbam/main'
-include { ALIGN_BAM                         as ALIGN_CONSENSUS_BAM         } from './modules/alignbam/main'
+include { ALIGN_BAM       as ALIGN_RAW_BAM               } from './modules/alignbam/main'
+include { ALIGN_BAM       as ALIGN_CONSENSUS_BAM         } from './modules/alignbam/main'
 
 
 
@@ -105,157 +105,6 @@ process FGBIO_FASTQTOBAM {
     """
 }
 
-process SAMTOOLS_FASTQ{
-    // convert unsorted bam back to fastq format
-    container "quay.io/biocontainers/samtools:1.17--h00cdaf9_0"
-    
-    input:
-    tuple val(meta), path(bamfile)
-
-    output:
-    tuple val(meta), path("*_with_rx.fastq.gz"), emit: fastq
-
-    when:
-    task.ext.when == null || task.ext.when
-
-    script:
-    def args = task.ext.args ?: ''
-    def prefix = task.ext.prefix ?: "${meta.id}"
-    """
-    samtools fastq $bamfile > ${prefix}_with_rx.fastq.gz 
-
-    """
-
-}
-
-process SAMTOOLS_SORT{
-    // sort bam by queryname
-    label 'process_medium'
-    container "quay.io/biocontainers/samtools:1.17--h00cdaf9_0"
-    
-    input:
-    tuple val(meta), path(bamfile)
-
-    output:
-    tuple val(meta), path("*_sortedbyqn.bam"), emit: bam
-
-    when:
-    task.ext.when == null || task.ext.when
-
-    script:
-    def args = task.ext.args ?: ''
-    def prefix = task.ext.prefix ?: "${meta.id}"
-    """
-    samtools sort \\
-        -n $bamfile \\
-        -o ${prefix}_sortedbyqn.bam
-
-    """
-
-}
-
-process BWAMEM2_INDEX {
-    tag "$fasta"
-    label 'process_high_memory'
-
-    conda "bioconda::bwa-mem2=2.2.1"
-    container 'quay.io/biocontainers/bwa-mem2:2.2.1--he513fc3_0'
-
-    input:
-    tuple val(meta), path(fasta)
-
-    output:
-    tuple val(meta), path("bwamem2"), emit: index
-    path "versions.yml"             , emit: versions
-
-    when:
-    task.ext.when == null || task.ext.when
-
-    script:
-    def args = task.ext.args ?: ''
-    """
-    mkdir bwamem2
-    bwa-mem2 \\
-        index \\
-        $args \\
-        $fasta -p bwamem2/${fasta}
-    cat <<-END_VERSIONS > versions.yml
-    "${task.process}":
-        bwamem2: \$(echo \$(bwa-mem2 version 2>&1) | sed 's/.* //')
-    END_VERSIONS
-    """
-
-    stub:
-    """
-    mkdir bwamem2
-    touch bwamem2/${fasta}.0123
-    touch bwamem2/${fasta}.ann
-    touch bwamem2/${fasta}.pac
-    touch bwamem2/${fasta}.amb
-    touch bwamem2/${fasta}.bwt.2bit.64
-    cat <<-END_VERSIONS > versions.yml
-    "${task.process}":
-        bwamem2: \$(echo \$(bwa-mem2 version 2>&1) | sed 's/.* //')
-    END_VERSIONS
-    """
-}
-
-process BWAMEM2_MEM {
-    tag "$meta.id"
-    label 'process_high'
-    publishDir "$params.outdir/bwa-mem", mode:'copy'
-
-    conda "bioconda::bwa-mem2=2.2.1 bioconda::samtools=1.16.1"
-    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
-        'https://depot.galaxyproject.org/singularity/mulled-v2-e5d375990341c5aef3c9aff74f96f66f65375ef6:2cdf6bf1e92acbeb9b2834b1c58754167173a410-0' :
-        'quay.io/biocontainers/mulled-v2-e5d375990341c5aef3c9aff74f96f66f65375ef6:2cdf6bf1e92acbeb9b2834b1c58754167173a410-0' }"
-
-    input:
-    tuple val(meta), path(reads)
-    path(index)
-    val   sort_bam
-
-    output:
-    tuple val(meta), path("*.bam"), emit: bam
-    path  "versions.yml"          , emit: versions
-
-    when:
-    task.ext.when == null || task.ext.when
-
-    script:
-    def args = task.ext.args ?: ''
-    def args2 = task.ext.args2 ?: ''
-    def prefix = task.ext.prefix ?: "${meta.id}"
-    def samtools_command = sort_bam ? 'sort' : 'view'
-    """
-    INDEX=`find -L ./ -name "*.amb" | sed 's/\\.amb\$//'`
-    bwa-mem2 \\
-        mem \\
-        $args \\
-        -t $task.cpus \\
-        \$INDEX \\
-        $reads \\
-        | samtools $samtools_command $args2 -@ $task.cpus -o ${prefix}.bam -
-
-    cat <<-END_VERSIONS > versions.yml
-    "${task.process}":
-        bwamem2: \$(echo \$(bwa-mem2 version 2>&1) | sed 's/.* //')
-        samtools: \$(echo \$(samtools --version 2>&1) | sed 's/^.*samtools //; s/Using.*\$//')
-    END_VERSIONS
-    """
-
-    stub:
-    def prefix = task.ext.prefix ?: "${meta.id}"
-    """
-    touch ${prefix}.bam
-    cat <<-END_VERSIONS > versions.yml
-    "${task.process}":
-        bwamem2: \$(echo \$(bwa-mem2 version 2>&1) | sed 's/.* //')
-        samtools: \$(echo \$(samtools --version 2>&1) | sed 's/^.*samtools //; s/Using.*\$//')
-    END_VERSIONS
-    """
-}
-
 process SAMTOOLS_INDEX {
     tag "$meta.id"
     label 'process_low'
@@ -348,51 +197,6 @@ process FREEBAYES {
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
         freebayes: \$(echo \$(freebayes --version 2>&1) | sed 's/version:\s*v//g' )
-    END_VERSIONS
-    """
-}
-
-process PICARD_SORTSAM {
-    tag "$meta.id"
-    label 'process_low'
-
-    conda "bioconda::picard=3.0.0"
-    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
-        'https://depot.galaxyproject.org/singularity/picard:3.0.0--hdfd78af_1' :
-        'quay.io/biocontainers/picard:3.0.0--hdfd78af_1' }"
-
-    input:
-    tuple val(meta), path(bam)
-    val sort_order
-
-    output:
-    tuple val(meta), path("*.bam"), emit: bam
-    path "versions.yml"                  , emit: versions
-
-    when:
-    task.ext.when == null || task.ext.when
-
-    script:
-    def args = task.ext.args ?: ''
-    def prefix = task.ext.prefix ?: "${meta.id}"
-    def avail_mem = 3072
-    if (!task.memory) {
-        log.info '[Picard SortSam] Available memory not known - defaulting to 3GB. Specify process memory requirements to change this.'
-    } else {
-        avail_mem = (task.memory.mega*0.8).intValue()
-    }
-    """
-    picard \\
-        SortSam \\
-        -Xmx${avail_mem}M \\
-        --INPUT $bam \\
-        --OUTPUT ${prefix}.bam \\
-        --SORT_ORDER $sort_order \\
-        --REFERENCE $params.fasta
-
-    cat <<-END_VERSIONS > versions.yml
-    "${task.process}":
-        picard: \$(picard SortSam --version 2>&1 | grep -o 'Version:.*' | cut -f2- -d:)
     END_VERSIONS
     """
 }
@@ -650,51 +454,41 @@ workflow {
             [ fmeta, fastq ]
 	}
     ch_fastq.view()
+
+    // run fastqc to assess read quality
     FASTQC ( ch_fastq )
- 
-//     if ( params.index ) {
-//         BWAMEM2_INDEX([ch_fastq, params.fasta])
-//         index_ch = BWAMEM2_INDEX.out
-//     }
-//     else { //otherwise get channel from params.bwaindex
-//         index_ch = Channel.fromPath(params.bwaindex, checkIfExists: true)
-//     }
-//    
-//    
-//    // call bwamem2
-//   BWAMEM2_MEM(SAMTOOLS_FASTQ.out.fastq, params.bwaindex, true)
-   
-   // fix RX tags
+    
+    //fix RX tags 
     FGBIO_FASTQTOBAM(ch_fastq)
-  //  SAMTOOLS_FASTQ(FGBIO_FASTQTOBAM.out.bam)
+
+    // initial alignment
     ALIGN_RAW_BAM(FGBIO_FASTQTOBAM.out.bam, params.fasta, params.dict, true)
     
-    
-   // SAMTOOLS_SORT(BWAMEM2_MEM.out.bam)
-    //PICARD_SORTSAM([['id': 'test', single_end: false], '/home/dnanexus/HCC1187BL_WGS_32465911.1x.bam'], "queryname")
-
+    // handle UMIs and collapse consensus reads based on UMI tags and alignment
     FGBIO_SETMATEINFORMATION(ALIGN_RAW_BAM.out.bam)
     FGBIO_GROUPREADSBYUMI(FGBIO_SETMATEINFORMATION.out.bam, "Edit")
     FGBIO_CALLDUPLEXCONSENSUSREADS(FGBIO_GROUPREADSBYUMI.out.bam)
     
+    // realign (using only consensus reads)
     ALIGN_CONSENSUS_BAM(FGBIO_CALLDUPLEXCONSENSUSREADS.out.bam, params.fasta, params.dict, false)
     
+    // index bam to create bam.bai
     SAMTOOLS_INDEX(ALIGN_CONSENSUS_BAM.out.bam)
 
+    // create channel with empty tuples for input to freebayes
     freebayes_ch = ALIGN_CONSENSUS_BAM.out.bam.join(SAMTOOLS_INDEX.out.bai)
     freebayes_ch.view()
-
     blank_ch = Channel.of([[],[],[]])
     blank_ch.view()
-
     freebayes_concat_ch = freebayes_ch.concat(blank_ch).toList()
     freebayes_concat_ch.view()
-
     freebayes_mapped = freebayes_concat_ch.map { it -> [it[0][0],it[0][1], it[0][2], it[1][0], it[1][1], it[1][2]]}
     freebayes_mapped.view()
    
+    // run freebayes to create vcf
     FREEBAYES(freebayes_mapped, params.fasta, params.fasta_fai, [], [], [])
 
-  //  ENSEMBLVEP_DOWNLOAD([['id': 'test', single_end: false],"GRCh37","homo_sapiens","108"])
+    // implement ENSEMBL VEP vcf annotation in future 
+  // ENSEMBLVEP_DOWNLOAD([['id': 'test', single_end: false],"GRCh37","homo_sapiens","108"])
   //  ENSEMBLVEP_VEP([['id': 'test', single_end: false], '/home/dnanexus/test.vcf.gz', [],], "GRCh37", "homo_sapiens", "108", '/home/dnanexus/vep_cache')
 }

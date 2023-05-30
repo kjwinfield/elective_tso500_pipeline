@@ -1,2 +1,0 @@
-#!/usr/bin/env groovy
-def meta = [id: "same", age: 42, city: "New York"]
